@@ -1,18 +1,10 @@
 import {Probot} from "probot";
+import fs from "fs";
+import extract from "extract-zip";
 
 export default (app: Probot) => {
     app.on(["pull_request.opened", "pull_request.reopened"], async (context) => {
-            context.octokit.rest.checks.create({
-                owner: 'tilsley-mettle-demo',
-                repo: 'test-repo',
-                name: 'some-check',
-                head_sha: `${context.payload.pull_request.head.sha}`,
-                output: {
-                    title: 'synk',
-                    summary: 'snyk has ran',
-                    text: 'dump snyk text here'
-                }
-            })
+
 
             const zip = await context.octokit.rest.repos.downloadZipballArchive({
                     owner: 'tilsley-mettle-demo',
@@ -21,30 +13,52 @@ export default (app: Probot) => {
                 }
             );
 
-            const zipData: any = zip.data
+            const filename = zip.headers['content-disposition']?.toString().split('filename=')[1].replace('.zip', '')
 
-            const fs = require('fs');
+            fs.writeFileSync('./tmp.zip', Buffer.from(zip.data as any));
+            await extract('./tmp.zip', {dir: `/tmp/${filename}`})
 
+            app.log.info("Checking to see if project contains gradle")
+            const gradleTestOutput = systemSync(`cd /tmp/${filename} && cd $(ls -d */|head -n 1) && ls && ./gradlew --version`)
 
-            const truncatedSha = context.payload.pull_request.head.sha.substring(0, 7)
+            if (gradleTestOutput.status != 0) {
+                app.log.info("Current project is not a gradle project, exiting without running snyk test")
+                return;
+            }
 
-            const repoDir = `/tmp/tilsley-mettle-demo-${context.payload.repository.name}-${truncatedSha}`
-            console.log(repoDir)
+            const createCheckResponse = await context.octokit.rest.checks.create({
+                owner: 'tilsley-mettle-demo',
+                repo: context.payload.repository.name,
+                name: 'snyk test',
+                head_sha: `${context.payload.pull_request.head.sha}`,
+                output: {
+                    title: 'snyk test',
+                    summary: 'running snyk test',
+                }
+            })
 
-            fs.writeFileSync('./tmp.zip', Buffer.from(zipData));
-            const extract = require('extract-zip')
-            await extract('./tmp.zip', {dir: '/tmp'})
+            app.log.info("Running snyk test")
+            const snykTestOutput = systemSync(`cd /tmp/${filename} && cd $(ls -d */|head -n 1) && snyk test`)
+            const conclusion = snykTestOutput.status == 0 ? 'success' : 'failure'
 
-            console.log('successfully extracted zip')
+            await context.octokit.rest.checks.update({
+                owner: 'tilsley-mettle-demo',
+                repo: context.payload.repository.name,
+                check_run_id: createCheckResponse.data.id,
+                conclusion: conclusion,
+                head_sha: `${context.payload.pull_request.head.sha}`,
+                output: {
+                    title: 'snyk test',
+                    summary: 'snyk has ran',
+                    text: snykTestOutput.stdout
+                }
+            })
 
+            app.log.info(`Completed snyk test with status ${snykTestOutput.status} removing folder /tmp/${filename}`)
 
-            console.log(systemSync("pwd").toString())
-            console.log(systemSync(`cd ${repoDir} && snyk test`).toString())
-
-
+            // fs.rmSync(`/tmp/${filename}`, {recursive: true, force: true});
         }
-    )
-    ;
+    );
 // For more information on building apps:
 // https://probot.github.io/docs/
 
@@ -56,11 +70,15 @@ export default (app: Probot) => {
 function systemSync(cmd: any) {
     const {execSync} = require('child_process')
     try {
-        return execSync(cmd).toString();
+        const execString: string = execSync(cmd).toString();
+        return {
+            status: 0,
+            stdout: execString
+        }
     } catch (error: any) {
-        console.log(error.status);  // Might be 127 in your example.
-        console.log(error.stderr);  // Holds the stderr output. Use `.toString()`.
-        console.log(error.stdout.toString());  // Holds the stdout output. Use `.toString()`.
-        return error.message; // Holds the message you typically want.
+        return {
+            status: error.status,
+            stdout: error.stdout.toString()
+        };
     }
 };
